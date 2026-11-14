@@ -1,0 +1,21 @@
+{
+	email {$ACME_EMAIL}
+}
+
+{$BASE_DOMAIN} {
+	handle /api/* {
+		reverse_proxy api:8080
+	}
+	handle {
+		reverse_proxy frontend:3000
+	}
+}
+
+# Wildcard-сертификат: ACME DNS-01 через плагин DNS-провайдера (по умолчанию Cloudflare).
+# Тот же сертификат использует DoT (853): контейнер dns читает его из тома caddy_data.
+*.dns.{$BASE_DOMAIN} {
+	tls {
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	}
+	reverse_proxy /dns-query* dns:8053
+}

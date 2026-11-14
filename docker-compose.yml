@@ -1,0 +1,109 @@
+# ShieldDNS — локальный и продакшен-запуск
+#   Только БД и кэш (Go и фронт запускаете на хосте):  docker compose up -d postgres redis
+#   Всё целиком:                                        docker compose --profile full up -d --build
+name: shielddns
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-shield}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shield_dev_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-shielddns}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      # выполняется один раз при создании тома; для сброса: docker compose down -v
+      - ./backend/migrations:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-shield} -d ${POSTGRES_DB:-shielddns}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "volatile-lru"]
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  dns:
+    profiles: ["full"]
+    build: { context: ./backend, target: dns }
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-shield}:${POSTGRES_PASSWORD:-shield_dev_pass}@postgres:5432/${POSTGRES_DB:-shielddns}?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      DNS_UDP_ADDR: ":53"
+      DOT_ADDR: ":853"
+      DOH_ADDR: ":8053"
+      # wildcard-сертификат, который получил Caddy (в dev файла нет → самоподписанный)
+      DOT_CERT: /caddy-data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/wildcard_.dns.${BASE_DOMAIN:-localhost}/wildcard_.dns.${BASE_DOMAIN:-localhost}.crt
+      DOT_KEY: /caddy-data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/wildcard_.dns.${BASE_DOMAIN:-localhost}/wildcard_.dns.${BASE_DOMAIN:-localhost}.key
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports:
+      - "${DNS_PUBLIC_PORT:-53}:53/udp"
+      - "${DNS_PUBLIC_PORT:-53}:53/tcp"
+      - "853:853/tcp"
+      - "127.0.0.1:8053:8053"   # DoH напрямую, для локальных тестов curl
+    volumes:
+      - caddy_data:/caddy-data:ro
+
+  api:
+    profiles: ["full"]
+    build: { context: ./backend, target: api }
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-shield}:${POSTGRES_PASSWORD:-shield_dev_pass}@postgres:5432/${POSTGRES_DB:-shielddns}?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  frontend:
+    profiles: ["full"]
+    build:
+      context: ./frontend
+      args: { API_INTERNAL_URL: "http://api:8080" }
+    restart: unless-stopped
+    expose:
+      - "3000"
+
+  caddy:
+    profiles: ["full"]
+    build: ./deploy/caddy
+    restart: unless-stopped
+    environment:
+      BASE_DOMAIN: ${BASE_DOMAIN:-localhost}
+      ACME_EMAIL: ${ACME_EMAIL:-admin@example.com}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ${CADDYFILE:-./deploy/caddy/Caddyfile.dev}:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [dns, api, frontend]
+
+volumes:
+  pg_data:
+  redis_data:
+  caddy_data:
+  caddy_config:
